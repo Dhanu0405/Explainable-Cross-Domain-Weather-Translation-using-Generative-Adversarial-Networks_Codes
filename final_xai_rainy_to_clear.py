@@ -7,17 +7,22 @@ Original file is located at
     https://colab.research.google.com/drive/14uQlkUW6rEy8GiCNp5HkpnYfUNj5aV4b
 """
 
-# Cell 1 — install packages (run once)
 !pip install --quiet torchvision
-# If you see version mismatch warnings for captum/torch, you might need to adjust versions to match your runtime torch.
 
-from google.colab import drive
-drive.mount('/content/drive')
 
-# Cell 2 — mount drive and set paths
+import torch, os, glob, random, numpy as np
+from torchvision import transforms
+from torchvision.utils import save_image
+from PIL import Image
+import matplotlib.pyplot as plt
+from collections import Counter
+import shap, cv2
+from skimage.segmentation import slic
+from scipy.ndimage import gaussian_filter
+from tqdm import tqdm
 
-# EDIT THESE to match your Drive layout
-DRIVE_ROOT = '/content/drive/MyDrive'
+
+DRIVE_ROOT = './'
 ZIP_PATH = f'{DRIVE_ROOT}/FDL_DS/rainy_models_and_ds/rainy-to-clear.zip'   # path to your zip file
 EXTRACT_DIR = '/content/dataset'            # where zip will be extracted
 WEIGHTS_CYCLEGAN = f'{DRIVE_ROOT}/FDL_DS/rainy_models_and_ds/G_BA_epoch_200_cyclegan_rainy_to_clear.pth'   # cycle generator weights
@@ -36,7 +41,6 @@ print("FastCUT weights =", WEIGHTS_FASTCUT)
 print("ResNet weights =", WEIGHTS_RESNET)
 print("OUTPUT_DIR =", OUTPUT_DIR)
 
-# Cell 3 — extract dataset zip (if already extracted this will overwrite/skip)
 import zipfile, os
 
 if os.path.exists(ZIP_PATH):
@@ -45,54 +49,41 @@ if os.path.exists(ZIP_PATH):
     print("Extracted zip to", EXTRACT_DIR)
 else:
     print("Zip file not found at", ZIP_PATH, "- if your dataset is already extracted, ignore this.")
-# list a few files to confirm
 sample_files = [f for f in os.listdir(EXTRACT_DIR) if f.lower().endswith(('.png','.jpg','.jpeg'))]
 print("Found", len(sample_files), "image files in", EXTRACT_DIR)
 
-# ✅ Final Cell 4 — use only snowy images for generation
-import torch, os, glob, random, numpy as np
-from torchvision import transforms
-from torchvision.utils import save_image
-from PIL import Image
-import matplotlib.pyplot as plt
-from collections import Counter
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print("Device:", device)
 
-# preprocessing/postprocess - adjust IMAGE_SIZE to match your training resolution
 IMAGE_SIZE = (256, 256)
 preprocess = transforms.Compose([
     transforms.Resize(IMAGE_SIZE),
     transforms.ToTensor(),
     transforms.Normalize((0.5,0.5,0.5), (0.5,0.5,0.5))
 ])
-postprocess = lambda t: ((t.clamp(-1,1) + 1) / 2)  # maps [-1,1] -> [0,1]
+postprocess = lambda t: ((t.clamp(-1,1) + 1) / 2)  
 
 # Parameters
-N_GENERATE = 150   # generate 300 images per model
+N_GENERATE = 150   
 NUM_SAMPLES_LIME = 200
 SHAP_NSAMPLES = 200
 DATASET_DIR = EXTRACT_DIR
 OUTPUT_DIR = OUTPUT_DIR
 
-# ✅ Recursively collect all images, but filter only those inside 'snowy' subfolder
 all_images = sorted(
     glob.glob(os.path.join(DATASET_DIR, "**", "*.jpg"), recursive=True)
     + glob.glob(os.path.join(DATASET_DIR, "**", "*.jpeg"), recursive=True)
     + glob.glob(os.path.join(DATASET_DIR, "**", "*.png"), recursive=True)
 )
 
-# Filter only snowy images
 rainy_images = [p for p in all_images if "rain" in os.path.basename(os.path.dirname(p)).lower()]
 
 assert len(rainy_images) > 0, f"No rainy images found under {DATASET_DIR}. Check your folder names."
 
-# summary print
 print(f"Found {len(rainy_images)} snowy images for generation.")
 print(f"Example snowy folder: {os.path.dirname(rainy_images[0])}")
 
-# shuffle and select first N_GENERATE
 random.seed(42)
 random.shuffle(rainy_images)
 generate_list = rainy_images[:N_GENERATE]
@@ -156,8 +147,6 @@ class GeneratorCycleGAN(nn.Module):
             return out, feats
         return out
 
-# Example: instantiate
-# G_cycle = GeneratorCycleGAN(n_res_blocks=6).to(device)
 
 # ---- Cell: GeneratorFastCUT ----
 import torch
@@ -217,8 +206,6 @@ class GeneratorFastCUT(nn.Module):
             return out, feats
         return out
 
-# Example: instantiate
-# G_fastcut = GeneratorFastCUT(n_res_blocks=9).to(device)
 
 # ---- Cell: GeneratorResNet ----
 import torch
@@ -277,13 +264,6 @@ class GeneratorResNet(nn.Module):
             return out, feats
         return out
 
-# Example: instantiate
-# G_resnet = GeneratorResNet(n_res_blocks=9).to(device)
-
-# Cell 7 — load weights and generate N_GENERATE images (saves to Drive)
-import torch
-from torchvision.utils import save_image
-import os
 
 # instantiate
 
@@ -308,40 +288,11 @@ try_load_weights(G_resnet, WEIGHTS_RESNET)
 
 G_cycle.eval(); G_fast.eval(); G_resnet.eval() # Ensure all models are in eval mode
 
-# generation function
-def generate_and_save(generator, prefix, input_paths, out_dir):
-    os.makedirs(out_dir, exist_ok=True)
-    saved = []
-    with torch.no_grad():
-        for i, p in enumerate(input_paths):
-            pil = Image.open(p).convert('RGB')
-            t = preprocess(pil).unsqueeze(0).to(device)
-            out = generator(t)
-            out_p = postprocess(out.detach().cpu())
-            save_path = os.path.join(out_dir, f"{prefix}_out_{i:04d}.png")
-            save_image(out_p, save_path)
-            saved.append(save_path)
-            if (i+1) % 50 == 0:
-                print(f"{prefix}: generated {i+1}/{len(input_paths)}")
-    print(f"{prefix}: finished generating {len(saved)} images to {out_dir}")
-    return saved
 
-# run generation (these will be saved to OUTPUT_DIR/cycle/ and OUTPUT_DIR/fastcut/)
-cycle_out_dir = os.path.join(OUTPUT_DIR, 'cycle_generated')
-fastcut_out_dir = os.path.join(OUTPUT_DIR, 'fastcut_generated')
-resnet_out_dir = os.path.join(OUTPUT_DIR, 'resnet_generated')
-
-cycle_saved = generate_and_save(G_cycle, 'cycle', generate_list, cycle_out_dir)
-fastcut_saved = generate_and_save(G_fast, 'fastcut', generate_list, fastcut_out_dir)
-resnet_saved = generate_and_save(G_resnet, 'resnet', generate_list, resnet_out_dir)
-
-# Cell 8 — pick the one image to use for all xAI analyses
-# We'll use the first image from the generated set (or you can pick any index)
-xai_index = 15   # change if you want a different image from the generated set
-input_for_xai = generate_list[xai_index]   # original input image path (from dataset)
+xai_index = 15   
+input_for_xai = generate_list[xai_index]   
 print("Using this single input image for xAI (same for all models):", input_for_xai)
 
-# Run both generators on this single image and keep tensors for analysis
 orig_pil = Image.open(input_for_xai).convert('RGB').resize(IMAGE_SIZE)
 inp_tensor = preprocess(orig_pil).unsqueeze(0).to(device)
 
@@ -367,7 +318,7 @@ display(Image.open(single_cycle_path))
 display(Image.open(single_fast_path))
 display(Image.open(single_resnet_path))
 
-# Fixed LIME cell — runs for CycleGAN, FastCUT, ResNet and plots in correct order
+# LIME cell — runs for CycleGAN, FastCUT, ResNet
 !pip install --quiet lime
 from lime import lime_image
 import numpy as np
@@ -450,13 +401,7 @@ plt.savefig(lime_side_path, bbox_inches='tight', pad_inches=0.1)
 plt.show()
 print("Saved LIME side-by-side to:", lime_side_path)
 
-# Fixed SHAP cell — runs for CycleGAN, FastCUT, ResNet and plots Original | Cycle | FastCUT | ResNet
-import shap, cv2
-import numpy as np
-from skimage.segmentation import slic
-from PIL import Image
-import matplotlib.pyplot as plt
-
+# SHAP cell — runs for CycleGAN, FastCUT, ResNet
 # parameters (adjust if already defined)
 N_SUPERPIXELS = 100
 SHAP_NSAMPLES = SHAP_NSAMPLES if 'SHAP_NSAMPLES' in globals() else 200
@@ -497,9 +442,7 @@ def make_shap_wrapper(generator, ref_np):
         return np.array(outs).reshape(-1,1)
     return fn
 
-# ensure ref outputs exist (computed earlier)
 with torch.no_grad():
-    # they should be available as out_cycle/out_fast/out_resnet; otherwise compute
     try:
         ref_cycle = out_cycle.detach().cpu().squeeze(0).numpy().transpose(1,2,0)
     except:
@@ -513,7 +456,6 @@ with torch.no_grad():
     except:
         ref_resnet = G_resnet(preprocess(orig_pil).unsqueeze(0).to(device)).detach().cpu().squeeze(0).numpy().transpose(1,2,0)
 
-# run shap for each model (this can take a while)
 print("Running SHAP for CycleGAN...")
 explainer_cycle = shap.KernelExplainer(make_shap_wrapper(G_cycle, ref_cycle), bg_flat, link="identity")
 x_flat = np.array(orig_pil.resize(IMAGE_SIZE)).astype(np.uint8).reshape(1, -1).astype(np.float64)
@@ -554,7 +496,6 @@ for sp_id in np.unique(segments):
     sp_heat_resnet[mask] = np.mean(perpix_resnet[mask])
 sp_heat_resnet = (sp_heat_resnet - sp_heat_resnet.min()) / (sp_heat_resnet.max() - sp_heat_resnet.min() + 1e-9)
 
-# Plot: Original | ResNet | CycleGAN | FastCUT
 plt.figure(figsize=(16,4))
 
 plt.subplot(1,4,1)
@@ -584,33 +525,23 @@ plt.show()
 
 print("Saved SHAP visualization to:", shap_side_path)
 
-# Fixed Occlusion cell — compute for ResNet, CycleGAN, FastCUT and plot Original | ResNet | CycleGAN | FastCUT
-import numpy as np
-import cv2
-import matplotlib.pyplot as plt
-from PIL import Image
-from scipy.ndimage import gaussian_filter
-from tqdm import tqdm
-
-# SETTINGS (tune for speed vs resolution)
-patch_size = 16    # smaller => higher spatial resolution
-stride = 8         # sliding stride
-blur_sigma = 1.0   # gaussian smoothing of final heatmap
+# Occlusion cell — compute for ResNet, CycleGAN, FastCUT
+patch_size = 16    
+stride = 8         
+blur_sigma = 1.0   
 overlay_alpha = 0.6
 
-# Ensure IMAGE_SIZE is (W,H)
 W, H = IMAGE_SIZE
 
 def occlusion_map(generator, inp_pil, patch_size=16, stride=8):
-    # inp_pil: PIL image (any size) -> will be resized to IMAGE_SIZE for processing
     inp_resized = inp_pil.resize((W, H))
-    base = np.array(inp_resized).astype(np.uint8)  # HxWx3
+    base = np.array(inp_resized).astype(np.uint8)  
     with torch.no_grad():
         t0 = preprocess(inp_resized).unsqueeze(0).to(device)
         out_ref = generator(t0)
         if isinstance(out_ref, (tuple, list)):
             out_ref = out_ref[0]
-        ref_out = out_ref.detach().cpu().squeeze(0).numpy().transpose(1,2,0)  # HWC [-1,1]
+        ref_out = out_ref.detach().cpu().squeeze(0).numpy().transpose(1,2,0)  
         ref_norm = (ref_out + 1.0) / 2.0
 
     heat = np.zeros((H, W), dtype=np.float32)
@@ -651,7 +582,6 @@ occ_cycle  = occlusion_map(G_cycle,  orig_pil, patch_size=patch_size, stride=str
 print("Computing occ for FastCUT...")
 occ_fast   = occlusion_map(G_fast,   orig_pil, patch_size=patch_size, stride=stride)
 
-# overlay helper: expects heat of shape (H,W) and returns uint8 image same size as IMAGE_SIZE
 def overlay_heat_on_image(img_pil, heat, cmap='hot', alpha=0.6):
     img_resized = img_pil.resize((W, H))
     # cv2.resize expects dsize as (width, height)
@@ -710,37 +640,28 @@ import numpy as np
 import os
 import matplotlib.pyplot as plt
 
-# User-tunable tile size
-TILE = 256   # px per tile (change to 224 for narrower paper-friendly figure)
+TILE = 256   
 OUT_PATH = os.path.join(OUTPUT_DIR, 'xai_grid_3x4.png')
 
-# Helper: convert various inputs into RGB PIL tile of size TILE x TILE
 def to_tile(img, size=(TILE, TILE), cmap=None):
     if img is None:
         return Image.new('RGB', size, (128,128,128))
-    # If PIL image
     if isinstance(img, Image.Image):
         return img.convert('RGB').resize(size)
-    # If numpy array
     arr = np.array(img)
-    # floats in [0,1] -> scale to 0..255
     if arr.dtype in (np.float32, np.float64):
         if arr.max() <= 1.0:
             arr = (arr * 255.0).astype(np.uint8)
         else:
             arr = (arr * 255.0).astype(np.uint8) if arr.max()<=1.0 else arr.astype(np.uint8)
-    # grayscale -> make 3-channel
     if arr.ndim == 2:
         arr = np.stack([arr]*3, axis=2)
-    # heatmap floats (0..1) with cmap
     if cmap is not None and arr.ndim == 2:
         cmap_func = plt.get_cmap(cmap)
         arr_rgb = (cmap_func(arr)[:,:,:3] * 255).astype(np.uint8)
         return Image.fromarray(arr_rgb).convert('RGB').resize(size)
-    # ensure uint8 HxWx3
     if arr.ndim == 3 and arr.shape[2] == 3:
         return Image.fromarray(arr.astype(np.uint8)).convert('RGB').resize(size)
-    # fallback
     return Image.new('RGB', size, (128,128,128))
 
 # Prepare source tiles (Original repeated in first column)
