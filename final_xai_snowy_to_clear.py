@@ -17,7 +17,6 @@ import matplotlib.pyplot as plt
 from collections import Counter
 from lime import lime_image
 from skimage.segmentation import slic
-from skimage.segmentation import slic
 
 DRIVE_ROOT = './'
 ZIP_PATH = f'{DRIVE_ROOT}/FDL_DS/snowy-clear-vgg.zip'   
@@ -228,7 +227,7 @@ class GeneratorFastCUT(nn.Module):
             return out_dec, feats
         return out_dec
 
-# ==== GeneratorResNet: architecture for your third model ====
+# GeneratorResNet
 import torch
 import torch.nn as nn
 
